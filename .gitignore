@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+outputs/
+parsed_data/
+example_data/
+original_data/validation/
+.pytest_cache/
