@@ -10,6 +10,8 @@ OUTPUTS = ROOT / "outputs"
 THESIS_DIR = OUTPUTS / "thesis_tables"
 
 
+# Builds thesis-ready cluster-composition tables for the Chapter 3 and Chapter 4
+# differentiation analyses.
 DATASETS = [
     {
         "dataset": "Chapter 3",

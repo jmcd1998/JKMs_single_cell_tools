@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent
 STATS_DIR = ROOT / "outputs" / "calcium_full_output_V1" / "stats"
 THESIS_DIR = ROOT / "outputs" / "thesis_tables"
 
+# Builds the thesis-ready mixed-model table for the Chapter 4 calcium analysis.
 REFERENCE_TREATMENT = "MDL29951"
 REFERENCE_CLUSTER = 0
 WINDOW_ORDER = {"w1": 1, "w2": 2, "w3": 3}

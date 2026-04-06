@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,24 +14,54 @@ from statsmodels.stats.anova import AnovaRM
 from statsmodels.stats.multitest import multipletests
 
 
+# This file is intentionally self-contained:
+# 1. If the parsed caspase summary table already exists, we use it directly.
+# 2. If it does not exist yet, we rebuild it from the source caspase CSV bundle.
+# 3. We then run the replicate-aware RM-ANOVA and treatment-versus-vehicle summaries.
+#
+# The script produces the Chapter 4 Figure 6 caspase bundle in one place so the
+# full path from source data to final plots and tables is easy to inspect.
+REPO_ROOT = Path(__file__).resolve().parent
+ORIGINAL_CASPASE_DIR = REPO_ROOT / "original_data" / "caspase" / "csvs"
+PARSED_CASPASE_DIR = REPO_ROOT / "parsed_data" / "caspase"
+PARSED_CASPASE_SUMMARY = PARSED_CASPASE_DIR / "caspase_summary_table.csv"
+PARSED_CASPASE_FILTERED = PARSED_CASPASE_DIR / "caspase_cell_data_legacy_filtered.csv"
+
+CASPASE_TREATMENT_PATTERN = re.compile(
+    r"(vehicle|pranlukast|mdl29951|hami3379|rwt9996|clemastine|h202)",
+    re.IGNORECASE,
+)
+CASPASE_TREATMENT_MAP = {
+    "vehicle": "vehicle",
+    "pranlukast": "pranlukast",
+    "mdl29951": "MDL29951",
+    "hami3379": "HAMI3379",
+    "rwt9996": "RWT9996",
+    "clemastine": "clemastine",
+    "h202": "H2O2",
+}
+DEFAULT_CASPASE_TREATMENT_ORDER = (
+    "vehicle",
+    "MDL29951",
+    "HAMI3379",
+    "pranlukast",
+    "RWT9996",
+    "clemastine",
+)
+DEFAULT_CASPASE_PHENOTYPE_ORDER = (
+    "PDGFRa",
+    "O4",
+    "MBP/O4",
+    "Marker Low",
+)
+
+
 @dataclass(frozen=True)
 class CaspaseGithubConfig:
     input_candidates: tuple[Path, ...]
     output_dir: Path
-    treatment_order: tuple[str, ...] = (
-        "vehicle",
-        "MDL29951",
-        "HAMI3379",
-        "pranlukast",
-        "RWT9996",
-        "clemastine",
-    )
-    phenotype_order: tuple[str, ...] = (
-        "PDGFRa",
-        "O4",
-        "MBP/O4",
-        "Marker Low",
-    )
+    treatment_order: tuple[str, ...] = DEFAULT_CASPASE_TREATMENT_ORDER
+    phenotype_order: tuple[str, ...] = DEFAULT_CASPASE_PHENOTYPE_ORDER
     phenotype_palette: dict[str, str] = None
     biol_rep_col: str = "biol_rep"
     treatment_col: str = "treatment"
@@ -40,13 +71,19 @@ class CaspaseGithubConfig:
 
     @property
     def input_path(self) -> Path:
+        # Prefer a prebuilt parsed table when present, but rebuild it locally from
+        # `original_data/caspase/csvs` if the user has only uploaded the raw bundle.
+        for path in self.input_candidates:
+            if path.exists():
+                return path
+        rebuild_caspase_parsed_inputs()
         for path in self.input_candidates:
             if path.exists():
                 return path
         missing = self.input_candidates[0]
         raise FileNotFoundError(
             f"Expected parsed caspase input at {missing}. "
-            "Run build_parsed_data_from_original_data.py first."
+            "Also tried rebuilding it from original_data/caspase/csvs."
         )
 
     @property
@@ -77,6 +114,108 @@ CASPASE_LEGACY_TO_STANDARD_PHENOTYPE = {
     "mbp like": "MBP/O4",
     "marker low": "Marker Low",
 }
+
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def rebuild_caspase_legacy_filtered_cells(raw_dir: Path) -> pd.DataFrame:
+    # Start from raw per-cell caspase/stain CSVs, recover treatment and replicate
+    # labels, derive caspase positivity, then assign a phenotype per cell before
+    # replicate-level aggregation.
+    csvs = sorted(raw_dir.glob("*.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"No caspase CSVs found in {raw_dir}")
+    df = pd.concat((pd.read_csv(path) for path in csvs), ignore_index=True)
+
+    df["treatment_raw"] = (
+        df["base_name"].astype(str).str.extract(CASPASE_TREATMENT_PATTERN, expand=False).str.lower()
+    )
+    df["treatment"] = df["treatment_raw"].map(CASPASE_TREATMENT_MAP).fillna("vehicle")
+    df["N"] = df["base_name"].astype(str).str.extract(r"(N\d+)", expand=False)
+    df["well"] = df["base_name"].astype(str).str.extract(r"_(\d+)_R\d+", expand=False)
+    df["fov"] = df["base_name"]
+
+    # Cells are classed as caspase positive when `caspase_area_px > 50`.
+    df["caspase_pos"] = pd.to_numeric(df["caspase_area_px"], errors="coerce") > 50
+    df["caspase_pos_bin"] = df["caspase_pos"].astype(int)
+
+    for marker in ["pdgfra", "o4", "mbp"]:
+        df[f"{marker}_frac"] = pd.to_numeric(df[f"{marker}_area_px"], errors="coerce") / pd.to_numeric(
+            df["cell_area_px"],
+            errors="coerce",
+        )
+
+    # The PDGFRa-like phenotype applies a size-prior adjustment, so that step is
+    # written out explicitly here instead of being hidden inside a generic utility.
+    log_cell_area = np.log1p(pd.to_numeric(df["cell_area_px"], errors="coerce"))
+    median = log_cell_area.median()
+    mad = float(np.median(np.abs(log_cell_area - median)))
+    if mad == 0:
+        mad = 1.0
+    df["size_prior_pdgfra"] = -((log_cell_area - median) / mad)
+
+    min_area = 150
+
+    def phenotype_with_size(row: pd.Series) -> str:
+        scores: dict[str, float] = {}
+        pdg_ok = row["pdgfra_area_px"] > min_area
+        o4_ok = row["o4_area_px"] > min_area
+        mbp_ok = row["mbp_area_px"] > min_area
+        scores["PDGFRa"] = row["pdgfra_frac"] + 0.3 * row["size_prior_pdgfra"] if pdg_ok else 0.0
+        scores["O4"] = row["o4_frac"] if o4_ok else 0.0
+        scores["MBP/O4"] = row["mbp_frac"] if mbp_ok else 0.0
+        if max(scores.values()) <= 0:
+            return "Marker Low"
+        return max(scores, key=scores.get)
+
+    df["phenotype"] = df.apply(phenotype_with_size, axis=1)
+    df = df[
+        df["treatment"].isin(DEFAULT_CASPASE_TREATMENT_ORDER)
+        & df["phenotype"].isin(DEFAULT_CASPASE_PHENOTYPE_ORDER)
+    ].copy()
+    df["N_well"] = df["N"].astype(str) + "_W" + df["well"].astype(str)
+    df["well_id"] = df["N_well"] + "_" + df["treatment"].astype(str)
+    return df
+
+
+def rebuild_caspase_parsed_inputs() -> Path:
+    # This is the self-contained replacement for requiring a separate
+    # `build_parsed_data_from_original_data.py` step before running caspase stats.
+    print("[prep] Parsed caspase summary missing; rebuilding it from original_data/caspase/csvs")
+    filtered = rebuild_caspase_legacy_filtered_cells(ORIGINAL_CASPASE_DIR)
+    ensure_parent(PARSED_CASPASE_FILTERED)
+    filtered.to_csv(PARSED_CASPASE_FILTERED, index=False)
+
+    summary = (
+        filtered.groupby(["N", "phenotype", "treatment"], observed=True)
+        .agg(
+            n_cells=("caspase_pos_bin", "size"),
+            n_caspase_pos=("caspase_pos_bin", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"N": "biol_rep"})
+    )
+    summary["frac_caspase_pos"] = summary["n_caspase_pos"] / summary["n_cells"]
+    summary = summary.drop(columns="n_caspase_pos")
+
+    summary["treatment"] = pd.Categorical(
+        summary["treatment"],
+        categories=DEFAULT_CASPASE_TREATMENT_ORDER,
+        ordered=True,
+    )
+    summary["phenotype"] = pd.Categorical(
+        summary["phenotype"],
+        categories=DEFAULT_CASPASE_PHENOTYPE_ORDER,
+        ordered=True,
+    )
+    summary = summary.sort_values(["phenotype", "treatment", "biol_rep"]).reset_index(drop=True)
+
+    ensure_parent(PARSED_CASPASE_SUMMARY)
+    summary.to_csv(PARSED_CASPASE_SUMMARY, index=False)
+    print(f"[prep] Wrote parsed caspase summary: {PARSED_CASPASE_SUMMARY}")
+    return PARSED_CASPASE_SUMMARY
 
 
 def ensure_output_dirs(config: CaspaseGithubConfig) -> None:
@@ -409,6 +548,11 @@ def plot_forest_by_phenotype(contrast_df: pd.DataFrame, config: CaspaseGithubCon
 
 
 def run_caspase_biolrep_stats(config: CaspaseGithubConfig) -> dict[str, object]:
+    # Keep the runtime flow obvious and linear:
+    # 1. resolve or rebuild the input table,
+    # 2. prepare replicate-level data,
+    # 3. write the main statistical tables,
+    # 4. write the summary figures.
     ensure_output_dirs(config)
     df = prepare_caspase_table(config)
     dataset_summary = write_dataset_summary(df, config)
@@ -447,10 +591,9 @@ def run_caspase_biolrep_stats(config: CaspaseGithubConfig) -> dict[str, object]:
 
 
 def build_default_config() -> CaspaseGithubConfig:
-    root = Path(__file__).resolve().parent
     return CaspaseGithubConfig(
-        input_candidates=(root / "parsed_data" / "caspase" / "caspase_summary_table.csv",),
-        output_dir=root / "outputs" / "caspase_output_V1",
+        input_candidates=(PARSED_CASPASE_SUMMARY,),
+        output_dir=REPO_ROOT / "outputs" / "caspase_output_V1",
     )
 
 

@@ -59,7 +59,10 @@ class ClusteredAnalysisConfig:
     treatment_reference: str = "Vehicle"
     optimizer_sequence: tuple[str, ...] = ("lbfgs", "bfgs", "cg")
     min_unique_values: int = 5
-    cluster_composition_inference: str = "chi_square"
+    # This readability-first RM-ANOVA clone defaults to the weighted-fraction
+    # repeated-measures path. The older chi-square route is still implemented
+    # below only so earlier pooled-count bundles remain reproducible.
+    cluster_composition_inference: str = "rm_anova_weighted_fraction"
     cluster_composition_posthoc_scope: str = "all_clusters_vs_vehicle"
     cell_count_inference: str = "rm_anova"
     legacy_mfi_point_every: int | None = 10
@@ -3448,6 +3451,10 @@ def run_clustered_analysis(config: ClusteredAnalysisConfig) -> dict[str, object]
         "cluster_inference_global": cluster_inference_results["global"],
         "cluster_inference_pairwise": cluster_inference_results["pairwise"],
         "cluster_inference_per_cluster": cluster_inference_results["per_cluster"],
+        # These chi_square_* keys are retained as backwards-compatible empty
+        # placeholders for older notebook/report code. In this RM-ANOVA bundle
+        # the active cluster-composition outputs are cluster_inference_* and
+        # cluster_composition_rm_anova*.
         "chi_square_composition": (
             cluster_inference_results["composition"]
             if config.cluster_composition_inference == "chi_square"

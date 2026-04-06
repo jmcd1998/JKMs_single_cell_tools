@@ -10,6 +10,8 @@ STATS_DIR = ROOT / "outputs" / "caspase_output_V1" / "stats"
 THESIS_DIR = ROOT / "outputs" / "thesis_tables"
 
 
+# Builds thesis-ready repeated-measures and post-hoc tables for the Chapter 4
+# caspase phenotype analysis.
 def format_p(value: float) -> str:
     if pd.isna(value):
         return ""
